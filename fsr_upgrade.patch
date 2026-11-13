@@ -1,0 +1,499 @@
+diff -ruN a/src/suyu/configuration/configure_graphics.cpp b/src/suyu/configuration/configure_graphics.cpp
+--- a/src/suyu/configuration/configure_graphics.cpp	2026-10-23 19:07:22.140223160 +0000
++++ b/src/suyu/configuration/configure_graphics.cpp	2026-10-25 15:00:44.802634334 +0000
+@@ -376,7 +376,9 @@
+         preset_label->setToolTip(
+             tr("Quick presets for FSR upscaling.\nQuality favors internal resolution, "
+                "Performance favors sharpening. Custom is selected automatically when the "
+-               "resolution or sharpness is changed manually."));
++               "resolution or sharpness is changed manually.\nFSR gives its best results when "
++               "the window has roughly 1x to 4x the pixel area of the internal resolution "
++               "(for example 1440p upscaled to a 4K window is 2.25x)."));
+         fsr_preset_combobox = new QComboBox(fsr_preset_row);
+         fsr_preset_combobox->addItem(tr("Quality"));
+         fsr_preset_combobox->addItem(tr("Balanced"));
+@@ -384,6 +386,18 @@
+         fsr_preset_combobox->addItem(tr("Custom"));
+         fsr_preset_combobox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+ 
++        // UPGRADE [7]: accessibility. Associate the label with the combobox (Alt+mnemonic and
++        // screen readers), give both controls explicit accessible names and keep the keyboard
++        // focus order sharpness slider -> preset -> next control.
++        preset_label->setBuddy(fsr_preset_combobox);
++        fsr_preset_combobox->setAccessibleName(tr("FSR preset"));
++        fsr_preset_combobox->setAccessibleDescription(preset_label->toolTip());
++        fsr_preset_combobox->setFocusPolicy(Qt::StrongFocus);
++        fsr_sharpness_slider->setAccessibleName(tr("FSR sharpness"));
++        fsr_sharpness_slider->setAccessibleDescription(
++            tr("Use the arrow keys to change the sharpening strength, shown in percent."));
++        QWidget::setTabOrder(fsr_sharpness_slider, fsr_preset_combobox);
++
+         preset_layout->addWidget(preset_label);
+         preset_layout->addWidget(fsr_preset_combobox);
+         fsr_preset_row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+@@ -392,18 +406,25 @@
+             Settings::ResolutionSetup target_res{};
+             int target_sharpness = 0;
+             switch (index) {
++            // Note: the slider stores raw RCAS "stops x 100" and is displayed reversed, so a
++            // LOWER raw value means MORE sharpening (75 -> 63 %, 50 -> 75 %, 25 -> 88 %).
++            // The resulting FSR area ratio depends on the window size; the figures below are
++            // for a 4K window (a 1x base of 720p).
+             case 0:
+-                // Quality: higher internal resolution, gentle sharpening
++                // Quality: 2X internal resolution (1440p -> 4K = 2.25x area, AMD's sweet
++                // spot), gentle sharpening
+                 target_res = Settings::ResolutionSetup::Res2X;
+                 target_sharpness = 75;
+                 break;
+             case 1:
+-                // Balanced: 1.5X internal resolution -> ~2.25x FSR area ratio (sweet spot)
++                // Balanced: 1.5X internal resolution (1080p -> 4K = 4x area, upper end of the
++                // recommended 1x-4x range)
+                 target_res = Settings::ResolutionSetup::Res3_2X;
+                 target_sharpness = 50;
+                 break;
+             case 2:
+-                // Performance: 1X internal resolution, strongest sharpening
++                // Performance: 1X internal resolution (720p -> 4K = 9x area, beyond the
++                // recommended range, so compensate with the strongest sharpening)
+                 target_res = Settings::ResolutionSetup::Res1X;
+                 target_sharpness = 25;
+                 break;
+diff -ruN a/src/suyu/configuration/shared_widget.cpp b/src/suyu/configuration/shared_widget.cpp
+--- a/src/suyu/configuration/shared_widget.cpp	2026-10-23 19:07:22.141580815 +0000
++++ b/src/suyu/configuration/shared_widget.cpp	2026-10-25 15:00:44.811717061 +0000
+@@ -344,6 +344,9 @@
+     }
+ 
+     slider->setInvertedAppearance(reversed);
++    // UPGRADE [7]: keyboard/mouse-wheel navigation must follow what is drawn. Without this a
++    // reversed slider moves its handle to the right on the Left arrow key.
++    slider->setInvertedControls(reversed);
+ 
+     if (!Settings::IsConfiguringGlobal()) {
+         QObject::connect(slider, &QAbstractSlider::actionTriggered, [touch]() { touch(); });
+diff -ruN a/src/video_core/fsr.cpp b/src/video_core/fsr.cpp
+--- a/src/video_core/fsr.cpp	2026-10-23 19:07:22.146415879 +0000
++++ b/src/video_core/fsr.cpp	2026-10-25 15:00:44.921085042 +0000
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <bit>
+ #include <mutex>
+@@ -164,6 +165,16 @@
+ // UPGRADE [5]: Cached negative LOD bias, written by the present thread and read
+ // from sampler creation on any thread.
+ std::atomic<f32> g_negative_lod_bias{0.0f};
++
++// UPGRADE [5]: Bumped whenever g_negative_lod_bias changes so cached samplers get rebuilt.
++std::atomic<u32> g_lod_bias_generation{0};
++
++void StoreNegativeLodBias(f32 bias) {
++    const f32 previous = g_negative_lod_bias.exchange(bias, std::memory_order_relaxed);
++    if (previous != bias) {
++        g_lod_bias_generation.fetch_add(1, std::memory_order_relaxed);
++    }
++}
+ } // Anonymous namespace
+ 
+ f32 AreaRatio(u32 input_width, u32 input_height, u32 output_width, u32 output_height) {
+@@ -175,10 +186,34 @@
+     return static_cast<f32>(out_area / in_area);
+ }
+ 
++PixelExtent CroppedExtent(u32 width, u32 height, const Common::Rectangle<f32>& crop) {
++    const f32 crop_width = (crop.right - crop.left) * static_cast<f32>(width);
++    const f32 crop_height = (crop.bottom - crop.top) * static_cast<f32>(height);
++    // A degenerate or NaN crop means "use everything"; also never report more than the
++    // framebuffer actually holds.
++    if (!(crop_width >= 1.0f) || !(crop_height >= 1.0f)) {
++        return {width, height};
++    }
++    return {
++        std::min(width, static_cast<u32>(std::lround(crop_width))),
++        std::min(height, static_cast<u32>(std::lround(crop_height))),
++    };
++}
++
+ bool IsUpscale(u32 input_width, u32 input_height, u32 output_width, u32 output_height) {
+     return AreaRatio(input_width, input_height, output_width, output_height) >= 1.0f;
+ }
+ 
++Settings::ScalingFilter ResolveScalingFilter(Settings::ScalingFilter requested, u32 input_width,
++                                             u32 input_height, u32 output_width,
++                                             u32 output_height) {
++    if (requested == Settings::ScalingFilter::Fsr &&
++        !IsUpscale(input_width, input_height, output_width, output_height)) {
++        return Settings::ScalingFilter::Bilinear;
++    }
++    return requested;
++}
++
+ void WarnAreaRatioOnce(u32 input_width, u32 input_height, u32 output_width, u32 output_height) {
+     const f32 ratio = AreaRatio(input_width, input_height, output_width, output_height);
+     if (ratio <= 0.0f) {
+@@ -193,14 +228,16 @@
+         g_ratio_warned[bucket] = true;
+     }
+     if (ratio > 4.0f) {
+-        // EASU is designed for 1x-4x area. Suggest an internal resolution that brings
+-        // the ratio down to the ~2.25x sweet spot (e.g. 720p -> 1440p -> 4K window).
+-        const f32 recommended = std::sqrt(ratio / 2.25f);
++        // EASU is designed for 1x-4x area. Raising the internal resolution by a linear
++        // factor f divides the area ratio by f^2, so f = sqrt(ratio / 2.25) brings it down
++        // to the ~2.25x sweet spot (e.g. 720p -> 1440p -> 4K window needs f = 2).
++        const f32 factor = std::sqrt(ratio / 2.25f);
+         LOG_WARNING(Render,
+                     "FSR: area ratio is {:.2f}x ({}x{} -> {}x{}), outside AMD's recommended "
+-                    "1x-4x area range. Consider raising the internal resolution to about "
+-                    "{:.1f}x so FSR upscales roughly 2.25x area for best quality.",
+-                    ratio, input_width, input_height, output_width, output_height, recommended);
++                    "1x-4x area range. Consider raising the internal resolution by about "
++                    "{:.1f}x relative to the current setting so FSR upscales roughly 2.25x "
++                    "area for best quality.",
++                    ratio, input_width, input_height, output_width, output_height, factor);
+     } else if (ratio < 1.0f) {
+         LOG_INFO(Render,
+                  "FSR: window is smaller than the render target (area ratio {:.2f}x); "
+@@ -222,17 +259,31 @@
+     if (Settings::values.fsr_negative_lod_bias.GetValue()) {
+         const f32 ratio = AreaRatio(input_width, input_height, output_width, output_height);
+         if (ratio > 1.0f) {
+-            // AMD: render with a negative MIP bias of about -log2(area ratio) so more
+-            // texture detail survives the upscale. Quantize to whole stops and clamp so
+-            // the sampler cache does not get churned on every window resize.
+-            bias = std::round(std::clamp(-std::log2(ratio), -2.0f, 0.0f));
++            // AMD: render with a negative MIP bias of about -log2(upscale ratio) so more
++            // texture detail survives the upscale. MIP level selection works per axis, so
++            // the ratio that matters is the linear one, sqrt(area ratio); using the area
++            // ratio directly would double the bias. Quantize to half stops and clamp so
++            // the sampler cache does not get rebuilt on every window resize.
++            bias = -0.5f * std::log2(ratio);
++            bias = std::clamp(std::round(bias * 2.0f) / 2.0f, -2.0f, 0.0f);
+         }
+     }
+-    g_negative_lod_bias.store(bias, std::memory_order_relaxed);
++    StoreNegativeLodBias(bias);
++}
++
++void ClearNegativeLodBias() {
++    // Called every frame while FSR is not the active filter, so keep the common case cheap.
++    if (g_negative_lod_bias.load(std::memory_order_relaxed) != 0.0f) {
++        StoreNegativeLodBias(0.0f);
++    }
+ }
+ 
+ f32 CurrentNegativeLodBias() {
+     return g_negative_lod_bias.load(std::memory_order_relaxed);
+ }
+ 
++u32 LodBiasGeneration() {
++    return g_lod_bias_generation.load(std::memory_order_relaxed);
++}
++
+ } // namespace FSR
+diff -ruN a/src/video_core/fsr.h b/src/video_core/fsr.h
+--- a/src/video_core/fsr.h	2026-10-23 19:07:22.146431279 +0000
++++ b/src/video_core/fsr.h	2026-10-25 15:00:44.921194463 +0000
+@@ -8,6 +8,8 @@
+ 
+ #include <numeric>
+ #include "common/common_types.h"
++#include "common/math_util.h"
++#include "common/settings_enums.h"
+ 
+ namespace FSR {
+ // Reimplementations of the constant generating functions in ffx_fsr1.h
+@@ -24,11 +26,28 @@
+ /// (e.g. internal resolution 1.5x upscaled to the window) gives the best quality.
+ f32 AreaRatio(u32 input_width, u32 input_height, u32 output_width, u32 output_height);
+ 
++/// UPGRADE [3]: Size in pixels of the valid image area inside a framebuffer of the given
++/// size. Many Switch games use dynamic resolution, so only a sub-rectangle (the crop) of
++/// the framebuffer holds the image. Area ratios must be judged on that sub-rectangle, not on
++/// the whole texture. Falls back to the full size if the crop is degenerate.
++struct PixelExtent {
++    u32 width;
++    u32 height;
++};
++PixelExtent CroppedExtent(u32 width, u32 height, const Common::Rectangle<f32>& crop);
++
+ /// UPGRADE [4]: Returns false when the FSR pass would be a downscale (area ratio < 1).
+ /// EASU is not a proper downscaling filter, so callers should skip FSR and let the
+ /// window adapt filter (bilinear/bicubic) perform the downscale instead.
+ bool IsUpscale(u32 input_width, u32 input_height, u32 output_width, u32 output_height);
+ 
++/// UPGRADE [4]: Resolves the scaling filter that should actually run for this frame. FSR
++/// (EASU) is not a downscaling filter, so a requested FSR with an area ratio < 1 is
++/// replaced by Bilinear (the window adapt filter that FSR already presents through).
++Settings::ScalingFilter ResolveScalingFilter(Settings::ScalingFilter requested, u32 input_width,
++                                             u32 input_height, u32 output_width,
++                                             u32 output_height);
++
+ /// UPGRADE [1]: Logs a warning (rate limited, once per log2 area-ratio bucket) when the
+ /// area ratio is outside AMD's recommended 1x-4x range, including a concrete
+ /// recommendation for the internal resolution setting.
+@@ -39,13 +58,24 @@
+ f32 GetSharpeningStops();
+ 
+ /// UPGRADE [5]: Computes (and caches) the negative MIP LOD bias recommended by AMD
+-/// (-log2 of the area ratio, quantized to whole stops and clamped to [-2, 0]) while
+-/// FSR is actively upscaling and the user opted in. No-op otherwise.
++/// (-log2 of the per-axis upscale ratio, i.e. -0.5 * log2(area ratio), quantized to half
++/// stops and clamped to [-2, 0]) while FSR is actively upscaling and the user opted in.
++/// MIP selection works per axis, so the linear ratio is used rather than the area ratio.
++/// Bumps LodBiasGeneration() whenever the cached value changes.
+ void UpdateNegativeLodBias(u32 input_width, u32 input_height, u32 output_width,
+                            u32 output_height);
+ 
++/// UPGRADE [5]: Resets the cached bias to 0. Must be called while a different scaling filter
++/// is active, otherwise the bias from a previous FSR session would stick to every sampler.
++void ClearNegativeLodBias();
++
+ /// UPGRADE [5]: Current cached negative LOD bias (0 when the feature is disabled or
+ /// FSR is not upscaling). Safe to call from any thread.
+ f32 CurrentNegativeLodBias();
+ 
++/// UPGRADE [5]: Incremented every time CurrentNegativeLodBias() changes. Guest samplers are
++/// cached with the bias baked in, so the texture cache compares this counter to know when
++/// its samplers must be rebuilt. Safe to call from any thread.
++u32 LodBiasGeneration();
++
+ } // namespace FSR
+diff -ruN a/src/video_core/renderer_opengl/present/fsr.cpp b/src/video_core/renderer_opengl/present/fsr.cpp
+--- a/src/video_core/renderer_opengl/present/fsr.cpp	2026-10-23 19:07:22.151636499 +0000
++++ b/src/video_core/renderer_opengl/present/fsr.cpp	2026-10-25 15:00:44.935200093 +0000
+@@ -65,11 +65,15 @@
+     sampler = CreateBilinearSampler();
+     framebuffer.Create();
+ 
++    // UPGRADE [6]: AMD's header recommends 32bpp formats for the intermediate textures.
++    // RGBA8 keeps a full 8-bit alpha (needed when layers are alpha blended afterwards),
++    // halves the bandwidth of the 64bpp RGBA16F targets used before and, being UNORM,
++    // also guarantees RCAS never sees values outside [0, 1].
+     easu_tex.Create(GL_TEXTURE_2D);
+-    glTextureStorage2D(easu_tex.handle, 1, GL_RGBA16F, width, height);
++    glTextureStorage2D(easu_tex.handle, 1, GL_RGBA8, width, height);
+ 
+     rcas_tex.Create(GL_TEXTURE_2D);
+-    glTextureStorage2D(rcas_tex.handle, 1, GL_RGBA16F, width, height);
++    glTextureStorage2D(rcas_tex.handle, 1, GL_RGBA8, width, height);
+ }
+ 
+ FSR::~FSR() = default;
+diff -ruN a/src/video_core/renderer_opengl/present/layer.cpp b/src/video_core/renderer_opengl/present/layer.cpp
+--- a/src/video_core/renderer_opengl/present/layer.cpp	2026-10-23 19:07:22.151680822 +0000
++++ b/src/video_core/renderer_opengl/present/layer.cpp	2026-10-25 15:00:44.935366968 +0000
+@@ -70,19 +70,22 @@
+     glDisablei(GL_SCISSOR_TEST, 0);
+ 
+     if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr) {
+-        // UPGRADE [1]/[4]/[5]: guidance, automatic filter selection and optional negative
++        // UPGRADE [1]/[3]/[4]/[5]: guidance, automatic filter selection and optional negative
+         // LOD bias. EASU is not a downscaling filter, so when the window is smaller than
+         // the render target we skip the FSR pass and let the window adapt filter do a
+         // proper downscale with the original crop preserved.
++        // Games with dynamic resolution only fill part of the framebuffer, so every ratio
++        // below is computed on the valid (cropped) area rather than the whole texture.
+         // NOTE: ::FSR refers to the free-function namespace in video_core/fsr.h, not to
+         // OpenGL::FSR (the present pass class below).
+         const u32 screen_width = static_cast<u32>(layout.screen.GetWidth());
+         const u32 screen_height = static_cast<u32>(layout.screen.GetHeight());
+-        ::FSR::WarnAreaRatioOnce(info.scaled_width, info.scaled_height, screen_width,
+-                                 screen_height);
+-        ::FSR::UpdateNegativeLodBias(info.scaled_width, info.scaled_height, screen_width,
+-                                     screen_height);
+-        if (::FSR::IsUpscale(info.scaled_width, info.scaled_height, screen_width, screen_height)) {
++        const auto valid = ::FSR::CroppedExtent(info.scaled_width, info.scaled_height, crop);
++        ::FSR::WarnAreaRatioOnce(valid.width, valid.height, screen_width, screen_height);
++        ::FSR::UpdateNegativeLodBias(valid.width, valid.height, screen_width, screen_height);
++        if (::FSR::ResolveScalingFilter(Settings::ScalingFilter::Fsr, valid.width, valid.height,
++                                        screen_width, screen_height) ==
++            Settings::ScalingFilter::Fsr) {
+             if (!fsr || fsr->NeedsRecreation(layout.screen)) {
+                 fsr.emplace(screen_width, screen_height);
+             }
+@@ -90,6 +93,9 @@
+             texture = fsr->Draw(program_manager, texture, info.scaled_width, info.scaled_height, crop);
+             crop = {0, 0, 1, 1};
+         }
++    } else {
++        // UPGRADE [5]: FSR is not the active filter, so drop any bias left from an FSR session.
++        ::FSR::ClearNegativeLodBias();
+     }
+ 
+     out_matrix =
+diff -ruN a/src/video_core/renderer_vulkan/present/fsr.cpp b/src/video_core/renderer_vulkan/present/fsr.cpp
+--- a/src/video_core/renderer_vulkan/present/fsr.cpp	2026-10-23 19:07:22.152100786 +0000
++++ b/src/video_core/renderer_vulkan/present/fsr.cpp	2026-10-25 15:00:45.033658636 +0000
+@@ -25,6 +25,15 @@
+ 
+ using PushConstants = std::array<u32, 4 * 4>;
+ 
++namespace {
++// UPGRADE [6]: AMD's header recommends 32bpp formats for the intermediate textures. RGBA8
++// UNORM is mandatory for sampled/color-attachment/storage use on every Vulkan device, keeps
++// a full 8-bit alpha (needed when layers are alpha blended afterwards) and, being UNORM,
++// also guarantees RCAS never sees values outside [0, 1]. This halves the bandwidth of the
++// 64bpp RGBA16F targets used before.
++constexpr VkFormat INTERMEDIATE_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
++} // Anonymous namespace
++
+ FSR::FSR(const Device& device, MemoryAllocator& memory_allocator, size_t image_count, VkExtent2D extent)
+     : m_memory_allocator{memory_allocator}
+     , m_image_count{image_count}
+@@ -44,15 +53,15 @@
+ void FSR::CreateImages(const Device& device) {
+     m_dynamic_images.resize(m_image_count);
+     for (auto& images : m_dynamic_images) {
+-        images.images[Easu] = CreateWrappedImage(m_memory_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
+-        images.images[Rcas] = CreateWrappedImage(m_memory_allocator, m_extent, VK_FORMAT_R16G16B16A16_SFLOAT);
+-        images.image_views[Easu] = CreateWrappedImageView(device, images.images[Easu], VK_FORMAT_R16G16B16A16_SFLOAT);
+-        images.image_views[Rcas] = CreateWrappedImageView(device, images.images[Rcas], VK_FORMAT_R16G16B16A16_SFLOAT);
++        images.images[Easu] = CreateWrappedImage(m_memory_allocator, m_extent, INTERMEDIATE_FORMAT);
++        images.images[Rcas] = CreateWrappedImage(m_memory_allocator, m_extent, INTERMEDIATE_FORMAT);
++        images.image_views[Easu] = CreateWrappedImageView(device, images.images[Easu], INTERMEDIATE_FORMAT);
++        images.image_views[Rcas] = CreateWrappedImageView(device, images.images[Rcas], INTERMEDIATE_FORMAT);
+     }
+ }
+ 
+ void FSR::CreateRenderPasses(const Device& device) {
+-    m_renderpass = CreateWrappedRenderPass(device, VK_FORMAT_R16G16B16A16_SFLOAT);
++    m_renderpass = CreateWrappedRenderPass(device, INTERMEDIATE_FORMAT);
+     for (auto& images : m_dynamic_images) {
+         images.framebuffers[Easu] = CreateWrappedFramebuffer(device, m_renderpass, images.image_views[Easu], m_extent);
+         images.framebuffers[Rcas] = CreateWrappedFramebuffer(device, m_renderpass, images.image_views[Rcas], m_extent);
+diff -ruN a/src/video_core/renderer_vulkan/present/layer.cpp b/src/video_core/renderer_vulkan/present/layer.cpp
+--- a/src/video_core/renderer_vulkan/present/layer.cpp	2026-10-23 19:07:22.152145139 +0000
++++ b/src/video_core/renderer_vulkan/present/layer.cpp	2026-10-25 15:00:45.067539625 +0000
+@@ -122,25 +122,32 @@
+     };
+ 
+     if (auto* fsr = std::get_if<FSR>(&sr_filter)) {
+-        // UPGRADE [1]/[4]/[5]: guidance, automatic filter selection and optional negative
++        // UPGRADE [1]/[3]/[4]/[5]: guidance, automatic filter selection and optional negative
+         // LOD bias. EASU is not a downscaling filter, so when the FSR output would be
+         // smaller than the input we skip the pass and let the window adapt filter do a
+         // proper downscale with the original crop preserved.
++        // Games with dynamic resolution only fill part of the framebuffer, so every ratio
++        // below is computed on the valid (cropped) area rather than the whole texture.
+         // NOTE: ::FSR refers to the free-function namespace in video_core/fsr.h, not to
+         // Vulkan::FSR (the present pass class).
+         const VkExtent2D fsr_extent = fsr->Extent();
+-        ::FSR::WarnAreaRatioOnce(render_extent.width, render_extent.height, fsr_extent.width,
+-                                 fsr_extent.height);
+-        ::FSR::UpdateNegativeLodBias(render_extent.width, render_extent.height, fsr_extent.width,
++        const auto valid = ::FSR::CroppedExtent(render_extent.width, render_extent.height, crop_rect);
++        ::FSR::WarnAreaRatioOnce(valid.width, valid.height, fsr_extent.width, fsr_extent.height);
++        ::FSR::UpdateNegativeLodBias(valid.width, valid.height, fsr_extent.width,
+                                      fsr_extent.height);
+-        if (::FSR::IsUpscale(render_extent.width, render_extent.height, fsr_extent.width,
+-                             fsr_extent.height)) {
++        if (::FSR::ResolveScalingFilter(Settings::ScalingFilter::Fsr, valid.width, valid.height,
++                                        fsr_extent.width, fsr_extent.height) ==
++            Settings::ScalingFilter::Fsr) {
+             source_image_view = fsr->Draw(device, scheduler, image_index, source_image, source_image_view, render_extent, crop_rect);
+             crop_rect = {0, 0, 1, 1};
+         }
+     } else if (auto* sgsr = std::get_if<SGSR>(&sr_filter)) {
++        ::FSR::ClearNegativeLodBias();
+         source_image_view = sgsr->Draw(device, scheduler, image_index, source_image, source_image_view, render_extent, crop_rect);
+         crop_rect = {0, 0, 1, 1};
++    } else {
++        // UPGRADE [5]: FSR is not the active filter, so drop any bias left from an FSR session.
++        ::FSR::ClearNegativeLodBias();
+     }
+ 
+     SetMatrixData(device, *out_push_constants, layout);
+diff -ruN a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h	2026-10-23 19:07:22.154260022 +0000
++++ b/src/video_core/texture_cache/texture_cache.h	2026-10-25 15:00:45.045897373 +0000
+@@ -18,6 +18,7 @@
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/kepler_compute.h"
++#include "video_core/fsr.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/image_view_base.h"
+@@ -179,6 +180,7 @@
+     sentenced_images.Tick();
+     sentenced_framebuffers.Tick();
+     sentenced_image_view.Tick();
++    sentenced_samplers.Tick();
+     TickAsyncDecode();
+     TickAsyncUnswizzle();
+ 
+@@ -308,6 +310,7 @@
+ 
+ template <class P>
+ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
++    RefreshSamplersForLodBias();
+     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
+     if (index > table.current_limit) {
+         LOG_DEBUG(HW_GPU, "Invalid sampler index={}", index);
+@@ -1883,6 +1886,28 @@
+ }
+ 
+ template <class P>
++void TextureCache<P>::RefreshSamplersForLodBias() {
++    const u32 generation = ::FSR::LodBiasGeneration();
++    if (channel_state->sampler_lod_bias_generation == generation) {
++        return;
++    }
++    channel_state->sampler_lod_bias_generation = generation;
++    // The FSR negative LOD bias is baked into each sampler when it is created, so a bias
++    // change (window resize, FSR toggled, setting changed) must rebuild them. Rebuilding in
++    // place keeps every SamplerId, and every Sampler pointer, held by the descriptor tables
++    // valid. The old objects may still be referenced by in-flight GPU work, so they are
++    // destroyed a few ticks later instead of immediately.
++    for (const auto& [config, sampler_id] : channel_state->samplers) {
++        if (!sampler_id || sampler_id == CORRUPT_ID) {
++            continue;
++        }
++        Sampler& sampler = slot_samplers[sampler_id];
++        sentenced_samplers.Push(std::move(sampler));
++        sampler = Sampler(runtime, config);
++    }
++}
++
++template <class P>
+ std::optional<size_t> TextureCache<P>::QuerySamplerBudget() const {
+     if constexpr (requires { runtime.GetSamplerHeapBudget(); }) {
+         return runtime.GetSamplerHeapBudget();
+diff -ruN a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h	2026-10-23 19:07:22.154291253 +0000
++++ b/src/video_core/texture_cache/texture_cache_base.h	2026-10-25 15:00:45.046604663 +0000
+@@ -87,6 +87,9 @@
+     std::unordered_map<TSCEntry, SamplerId> samplers;
+ 
+     ankerl::unordered_dense::map<u32, SamplerId> sampler_ids;
++
++    /// UPGRADE [5]: FSR::LodBiasGeneration() these samplers were last built for.
++    u32 sampler_lod_bias_generation{};
+     ankerl::unordered_dense::map<u32, ImageViewId> image_view_ids;
+ 
+     TextureCacheGPUMap* gpu_page_table = nullptr;
+@@ -338,6 +341,10 @@
+     /// Find or create a sampler from a guest descriptor sampler
+     [[nodiscard]] SamplerId FindSampler(const TSCEntry& config, bool compute);
+ 
++    /// UPGRADE [5]: Rebuilds the cached samplers of the current channel when the FSR negative
++    /// LOD bias changed since they were created (the bias is baked into the sampler state).
++    void RefreshSamplersForLodBias();
++
+     /// Find or create an image view for the given color buffer index
+     [[nodiscard]] ImageViewId FindColorBuffer(size_t index);
+ 
+@@ -499,6 +506,7 @@
+     DelayedDestructionRing<Image, TICKS_TO_DESTROY> sentenced_images;
+     DelayedDestructionRing<ImageView, TICKS_TO_DESTROY> sentenced_image_view;
+     DelayedDestructionRing<Framebuffer, TICKS_TO_DESTROY> sentenced_framebuffers;
++    DelayedDestructionRing<Sampler, TICKS_TO_DESTROY> sentenced_samplers;
+ 
+     ankerl::unordered_dense::map<GPUVAddr, ImageAllocId> image_allocs_table;
+ 
